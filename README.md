@@ -5,12 +5,17 @@ instance: it detects the task a script belongs to from its folder
 structure, shows feedback/comments (including drawover attachments), and
 publishes new versions with a comment and status change.
 
-This is the Nuke counterpart of a family of ports of the same plugin for
-Houdini, Maya, Krita and Blender — same features, same UI
-layout, same Kitsu-side behavior, with the host-specific pieces swapped
-for their Nuke equivalents (a Write-node render of what the Viewer shows
-instead of a flipbook, feedback nodes on the Viewer's second input
-instead of a viewport background image).
+"Capture" means a render, not a screen grab: publishing renders the node
+the Viewer is currently showing (the input the 1/2/3… keys pick) through
+a temporary Write node, at full format resolution with Nuke's own colour
+management. The Write node is created with undo disabled and deleted
+again in a `finally`, so a capture never lands in the undo stack or
+survives in the script. This publishes the *image*, not the Viewer's
+display state — the Viewer's gain/gamma sliders and viewer process LUT
+are viewing transforms and are deliberately not baked in. If the script
+is in **proxy mode**, everything Nuke renders — captures included —
+comes out at proxy resolution; the panel says so rather than changing
+that setting behind your back.
 
 All Kitsu/Zou protocol handling (auth, endpoints, uploads/downloads) is
 delegated to CGWire's official [`gazu`](https://github.com/cgwire/gazu)
@@ -25,51 +30,6 @@ Built and verified against **Nuke 16.0v6** (Python 3.11, PySide6/Qt
 6.5). The Qt imports fall back to PySide2, so it should also run on Nuke
 13–15, but only Nuke 16 was actually tested — see "Verification status"
 below for exactly what was and wasn't exercised.
-
-## Differences from the Maya/Houdini/Krita/Blender versions
-
-Every feature from the other four ports is present here — nothing is
-dropped — but a few are implemented differently because Nuke's own
-capabilities are different:
-
-- **"Capture" means a render, not a screen grab.** Maya playblasts the
-  viewport and Houdini flipbooks it; Nuke instead renders the node the
-  Viewer is currently showing (the input the 1/2/3… keys pick) through a
-  temporary Write node, at full format resolution with Nuke's own colour
-  management. The Write node is created with undo disabled and deleted
-  again in a `finally`, so a capture never lands in the undo stack or
-  survives in the script. Note this publishes the *image*, not the
-  Viewer's display state: the Viewer's gain/gamma sliders and viewer
-  process LUT are viewing transforms and are deliberately not baked in.
-  If the script is in **proxy mode**, everything Nuke renders — captures
-  included — comes out at proxy resolution; the panel says so rather
-  than changing that setting behind your back.
-- **Full-scene video export** ("Publish Capture") needs no external
-  `ffmpeg` binary at all: Nuke's own Write node encodes H.264 into an
-  `.mp4` directly (the Maya and Houdini ports have to shell out to a
-  system `ffmpeg`, because neither playblast nor flipbook can produce
-  H.264). Only Blender's port is similarly self-contained.
-- **Drawovers become nodes on the Viewer's second input.** Maya attaches
-  a camera image plane and Houdini sets a viewport background image;
-  Nuke gets real nodes named `Kitsu_Feedback_<revision>`, wired to the
-  Viewer's input 2 and switched to, so **2** shows the reviewer's markup
-  and **1** goes back to your comp. Your own node graph is never
-  rewired — the feedback nodes are added alongside it, and deleting them
-  removes the overlay again. Re-clicking for the same revision replaces
-  that revision's nodes instead of stacking duplicates.
-- **There is no "Add Timeline Markers".** Nuke's comp Viewer has no
-  scriptable timeline markers to place them on — its timeline carries
-  only the playhead and in/out points, and the frame markers people
-  remember are a Nuke Studio editorial-timeline feature, not a comp one.
-  Instead of marking annotated frames in place, the panel lists them in
-  a **picker with a "Go to Frame" button** that jumps the playhead
-  straight to the frame a note was drawn on. (The per-frame drawover
-  overlay itself is unaffected and works exactly like the other ports'.)
-- **No shelf button.** Maya has "Add Shelf Button" and Houdini ships a
-  shelf; Nuke's equivalent surfaces are the **menu bar** ("Kitsu")
-  and the **pane menu** (the panel is registered as "Kitsu", so it can
-  be added to any pane like the Properties or Curve Editor panels).
-  Both are set up by the plugin's own `menu.py`.
 
 ## Folder layout
 
@@ -332,9 +292,10 @@ panel shows the revision as its thumbnail with the list of annotated
 frames plus:
 
 - A **frame picker + "Go to Frame"**, which moves the playhead to the
-  frame a note was drawn on. (This is where the other ports put "Add
-  Timeline Markers" — see "Differences" above for why Nuke gets
-  navigation instead of markers.)
+  frame a note was drawn on. Nuke's comp Viewer has no scriptable
+  timeline markers to place them on instead — its timeline carries only
+  the playhead and in/out points, and the frame markers people remember
+  are a Nuke Studio editorial-timeline feature, not a comp one.
 - **Show Drawovers in Viewer**, which builds a `Kitsu_Feedback_<revision>`
   node showing each frame's drawover **only on that exact frame**: the
   markup is rendered onto transparent images (one per frame of the
@@ -391,8 +352,8 @@ use **Kitsu → Publish Capture** in the menu bar.
 1. **Requirements**: the panel must already be open, logged in, and have
    a task detected (Publish Capture reuses that state rather than asking
    you to log in again), the script must be saved, and the Viewer must be
-   showing something. **No `ffmpeg` install is needed** — unlike the Maya
-   and Houdini ports, Nuke encodes the H.264 itself.
+   showing something. **No `ffmpeg` install is needed** — Nuke's own
+   Write node encodes the H.264 itself.
 2. A small dialog asks for a **task status** and a **comment**, the same
    two fields the panel's own Publish section asks for.
 3. The script's full frame range is rendered at its own fps, encoded to
@@ -464,10 +425,9 @@ runs the real `nuke` module against the real installed build:
   node has still been created and the reason is printed to the Script
   Editor rather than failing the whole operation.
 - **Not exercised at all**: anything requiring a live Kitsu server —
-  login, task/comment fetching, uploads, timesheet writes. The Kitsu-side
-  code is shared with the Maya/Houdini/Krita/Blender ports and unchanged
-  apart from the per-person time-spent lookup, which is carried over from
-  the Blender port's corrected version.
+  login, task/comment fetching, uploads, timesheet writes. This code
+  goes through the vendored `gazu` client and doesn't touch anything
+  Nuke-specific.
 
 Recommended before production use: open a real Nuke 16 session and walk
 through Login → Detect Task → Feedback (including a comment with a
