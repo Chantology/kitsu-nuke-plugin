@@ -494,20 +494,14 @@ with it can act as your account until it expires.
 
 This plugin is licensed under the **GNU Lesser General Public License,
 version 3** — the full text is in [LICENSE](LICENSE). LGPL-3.0 incorporates
-the terms of GPL-3.0 by reference, so a copy of that text is included as
-[COPYING.GPL-3.0](COPYING.GPL-3.0) as well.
+the terms of version 3 of the GNU General Public License by reference; that
+text is published at <https://www.gnu.org/licenses/gpl-3.0.txt>.
 
 LGPL rather than GPL is deliberate: it is the license that explicitly
 permits combining with proprietary code, which is what a plugin importing
 Nuke's closed-source `nuke` module does. Using it inside your studio is
 unrestricted; if you distribute a *modified* version of the plugin, your
 changes to it are expected to be available under the LGPL too.
-
-> **TODO before publishing:** add the copyright line for the rights holder,
-> e.g. `Copyright (C) 2026 <holder>`, here and — if you want the standard
-> FSF layout — as a short header in each source file. The `LICENSE` text
-> itself is the verbatim FSF document and correctly carries no project
-> name; the copyright notice is a separate statement.
 
 ## Third-party components
 
