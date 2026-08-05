@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Nuke
+*.nk~
+*.autosave
+.nuke/
+
+# Studio deployment (kept out of the public repo: contains local paths)
+deploy_paths.txt
+deploy_windows.cmd
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+*.bak
+*.orig
+.DS_Store
+Thumbs.db
+desktop.ini

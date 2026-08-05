@@ -1,0 +1,16 @@
+# Normalize to LF in the repository, regardless of a contributor's
+# core.autocrlf setting.
+* text=auto eol=lf
+
+# These must stay LF in the working tree on every platform: a CRLF
+# shebang line makes the shell report "bad interpreter: /bin/bash^M".
+*.sh      text eol=lf
+*.command text eol=lf
+
+# Batch files are Windows-only; CRLF is what cmd.exe expects.
+*.cmd     text eol=crlf
+
+# Binary / verbatim — never touch these.
+*.png     binary
+*.pem     -text
+*LICENSE  -text
