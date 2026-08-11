@@ -456,7 +456,13 @@ class KitsuPanel(QWidget):
             QMessageBox.warning(self, "Kitsu", "Detect a task before logging time.")
             return
 
-        minutes = self.time_slider.value()
+        # The slider itself only snaps to _TIME_SLIDER_STEP_MINUTES when
+        # dragged by hand -- the auto-advance timer sets it minute-by-minute
+        # (see _on_time_tracking_tick), so a Log Time click mid-tick could
+        # otherwise submit an odd value like 80, which Kitsu's web
+        # timesheet then shows as a repeating decimal ("1.3333333h").
+        step = self._TIME_SLIDER_STEP_MINUTES
+        minutes = round(self.time_slider.value() / step) * step
         user = self.current_user
         if user is None:
             # Normally resolved at login (_load_user_header); only re-fetched
