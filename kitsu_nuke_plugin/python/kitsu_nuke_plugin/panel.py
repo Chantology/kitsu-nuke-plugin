@@ -26,6 +26,7 @@ from .qt import (
     QComboBox,
     QFileDialog,
     QFormLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -48,7 +49,13 @@ from .qt import (
 from . import nuke_scene, settings, video_annotations
 from .annotations import picture_annotation_objects, render_annotations
 from .collapsible_section import CollapsibleSection
-from .kitsu_api import KitsuConnectionError, KitsuSession
+from .kitsu_api import (
+    KitsuConnectionError,
+    KitsuSession,
+    TwoFactorRequired,
+    WrongTwoFactorCode,
+    two_factor_prompt,
+)
 from .task_detection import TaskDetectionError, TaskTypeMismatch, detect_task
 from .versioning import parse_version_number
 
@@ -100,6 +107,7 @@ class KitsuPanel(QWidget):
         self._last_comment_ids = None  # ids currently rendered in comments_list, for change detection
         self._async_workers = []  # keeps _AsyncWorker instances alive for the life of their background call
         self._comment_poll_in_flight = False  # guards against a slow poll overlapping the next 60s tick
+        self._two_factor_methods = []  # set once the server asks for a 2FA code (see _on_login_clicked)
 
         self._comment_poll_timer = QTimer(self)
         self._comment_poll_timer.setInterval(60_000)  # 60s: background auto-refresh, no need for finer
@@ -277,11 +285,90 @@ class KitsuPanel(QWidget):
         self.user_thumbnail_label.setVisible(False)
         form.addRow(self.user_thumbnail_label)
 
+        # Hidden until a login attempt raises TwoFactorRequired — most
+        # accounts never see it.
+        self.two_factor_group = self._build_two_factor_group()
+        self.two_factor_group.setVisible(False)
+        form.addRow(self.two_factor_group)
+
         self.login_button = QPushButton("Login")
         self.login_button.clicked.connect(self._on_login_clicked)
         form.addRow(self.login_button)
 
         return group
+
+    _TWO_FACTOR_LABELS = {
+        "totp": "Authenticator App",
+        "email_otp": "Email Code",
+        "recovery_code": "Recovery Code",
+    }
+
+    def _build_two_factor_group(self):
+        group = QGroupBox("Two-Factor Authentication")
+        form = QFormLayout(group)
+
+        self.two_factor_method_label = QLabel("Method")
+        self.two_factor_method_combo = QComboBox()
+        self.two_factor_method_combo.currentIndexChanged.connect(
+            self._on_two_factor_method_changed
+        )
+        form.addRow(self.two_factor_method_label, self.two_factor_method_combo)
+
+        self.two_factor_code_edit = QLineEdit()
+        self.two_factor_code_edit.setPlaceholderText("Code")
+        form.addRow("Code", self.two_factor_code_edit)
+
+        self.send_email_code_button = QPushButton("Send Code")
+        self.send_email_code_button.setToolTip("Email a new two-factor code to this account")
+        self.send_email_code_button.clicked.connect(self._on_send_email_code_clicked)
+        form.addRow(self.send_email_code_button)
+
+        return group
+
+    def _current_two_factor_method(self):
+        return self.two_factor_method_combo.currentData()
+
+    def _show_two_factor(self, methods, preferred):
+        """Reveal the 2FA section for `methods` (preferred listed first)."""
+        self._two_factor_methods = list(methods)
+        ordered = [preferred] + [m for m in methods if m != preferred]
+        self.two_factor_method_combo.blockSignals(True)
+        self.two_factor_method_combo.clear()
+        for method in ordered:
+            self.two_factor_method_combo.addItem(
+                self._TWO_FACTOR_LABELS.get(method, method), method
+            )
+        self.two_factor_method_combo.setCurrentIndex(0)
+        self.two_factor_method_combo.blockSignals(False)
+        multiple = len(ordered) > 1
+        self.two_factor_method_label.setVisible(multiple)
+        self.two_factor_method_combo.setVisible(multiple)
+        self.two_factor_code_edit.clear()
+        self._update_two_factor_widgets()
+        self.two_factor_group.setVisible(True)
+        self.login_button.setText("Verify & Log In")
+
+    def _hide_two_factor(self):
+        self._two_factor_methods = []
+        self.two_factor_code_edit.clear()
+        self.two_factor_group.setVisible(False)
+        self.login_button.setText("Login")
+
+    def _update_two_factor_widgets(self):
+        self.send_email_code_button.setVisible(
+            self._current_two_factor_method() == "email_otp"
+        )
+
+    def _on_two_factor_method_changed(self, _index):
+        self._update_two_factor_widgets()
+        method = self._current_two_factor_method()
+        if not method:
+            return
+        if method == "email_otp":
+            # Don't auto-send on switch — the user clicks Send Code.
+            self._set_status("Click Send Code, then enter the emailed code and log in again.")
+        else:
+            self._set_status(two_factor_prompt(method))
 
     _PROJECT_THUMBNAIL_WIDTH = 120
 
@@ -618,6 +705,17 @@ class KitsuPanel(QWidget):
             QMessageBox.warning(self, "Kitsu", "Please enter an email/password or an API token.")
             return
 
+        # Only sent once the server has asked for it (TwoFactorRequired
+        # below) -- and never with a token login.
+        two_factor_method = None
+        two_factor_code = None
+        if self._two_factor_methods and not token:
+            two_factor_method = self._current_two_factor_method()
+            two_factor_code = self.two_factor_code_edit.text().strip()
+            if not two_factor_code:
+                self._set_status("Enter your two-factor code.", is_error=True)
+                return
+
         self._set_status("Connecting...")
         self.login_button.setEnabled(False)
 
@@ -629,7 +727,7 @@ class KitsuPanel(QWidget):
             if token:
                 session.login_with_token(token)
             else:
-                session.login(email, password)
+                session.login(email, password, two_factor_method, two_factor_code)
             project = session.project(project_id)
             return session, project
 
@@ -639,6 +737,7 @@ class KitsuPanel(QWidget):
             self.session = session
             self.project = project
             self.password_edit.clear()
+            self._hide_two_factor()
 
             if not token:
                 # Just logged in with email/password -- save the refresh
@@ -657,10 +756,43 @@ class KitsuPanel(QWidget):
 
         def on_error(exc):
             self.login_button.setEnabled(True)
-            if isinstance(exc, KitsuConnectionError):
+            if isinstance(exc, TwoFactorRequired):
+                # Password was right -- reveal the code field and ask again.
+                self._show_two_factor(exc.methods, exc.preferred)
+                self._set_status(str(exc))
+            elif isinstance(exc, WrongTwoFactorCode):
+                self.two_factor_code_edit.clear()
                 self._set_status(str(exc), is_error=True)
             else:
-                self._set_status(f"Unexpected error: {exc}", is_error=True)
+                self._hide_two_factor()
+                if isinstance(exc, KitsuConnectionError):
+                    self._set_status(str(exc), is_error=True)
+                else:
+                    self._set_status(f"Unexpected error: {exc}", is_error=True)
+
+        self._run_async(work, on_done, on_error)
+
+    def _on_send_email_code_clicked(self):
+        server_url = self.server_edit.text().strip()
+        email = self.email_edit.text().strip()
+        if not (server_url and email):
+            self._set_status("Enter the server URL and email first.", is_error=True)
+            return
+
+        self._set_status("Sending code...")
+        self.send_email_code_button.setEnabled(False)
+
+        def work():
+            # Background thread (see _run_async) -- network only.
+            KitsuSession(server_url).send_email_code(email)
+
+        def on_done(_result):
+            self.send_email_code_button.setEnabled(True)
+            self._set_status(two_factor_prompt("email_otp"))
+
+        def on_error(exc):
+            self.send_email_code_button.setEnabled(True)
+            self._set_status(str(exc), is_error=True)
 
         self._run_async(work, on_done, on_error)
 
