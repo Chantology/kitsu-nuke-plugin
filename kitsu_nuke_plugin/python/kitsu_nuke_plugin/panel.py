@@ -686,7 +686,10 @@ class KitsuPanel(QWidget):
 
     def _set_status(self, message, is_error=False):
         self.status_label.setText(message)
-        color = "#b00020" if is_error else "#0b7a0b"
+        # Light green/red picked for Nuke's dark UI: the dark #b00020 /
+        # #0b7a0b used previously were barely readable there (~1.6-1.8:1
+        # contrast on a #444444-ish panel; these are ~4.8:1 or better).
+        color = "#ff9999" if is_error else "#81c784"
         self.status_label.setStyleSheet(f"color: {color};")
 
     # ---- actions ----
