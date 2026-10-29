@@ -56,8 +56,80 @@ from .kitsu_api import (
     WrongTwoFactorCode,
     two_factor_prompt,
 )
-from .task_detection import TaskDetectionError, TaskTypeMismatch, detect_task
+from .task_detection import (
+    ShotNotFound,
+    ShotTree,
+    TaskDetectionError,
+    TaskTypeMismatch,
+    detect_entity,
+    resolve_task,
+    resolve_task_by_type_id,
+    task_type_folder_name,
+)
 from .versioning import parse_version_number
+
+
+def _detect_with_overrides(session, project, scene_path, shot_id, task_type_id):
+    """Folder detection plus the script's remembered manual picks, which
+    win over the folders. Runs on a background thread: network and
+    plain Python only.
+
+    Returns a dict -- `entity`, `breadcrumb`, `context` and
+    `task_type_name` (the folder name) describe what the picker would
+    apply to; `result` is detect_task's (task, breadcrumb, context) or
+    None with `error` saying why; `manual` is True when a remembered pick
+    was used; `shot_tree` is the loaded ShotTree, if one was needed.
+    Raises TaskDetectionError for an asset that can't be found.
+    """
+    outcome = {
+        "entity": None,
+        "breadcrumb": None,
+        "context": None,
+        "task_type_name": task_type_folder_name(scene_path) if scene_path else None,
+        "shot_tree": None,
+        "result": None,
+        "error": None,
+        "manual": False,
+    }
+    try:
+        entity, breadcrumb, task_type_name, context = detect_entity(
+            session, project, scene_path
+        )
+        outcome.update(
+            entity=entity, breadcrumb=breadcrumb, task_type_name=task_type_name, context=context
+        )
+    except ShotNotFound as exc:
+        outcome.update(context="shot", error=exc.reason)
+
+    if outcome["context"] == "shot" and (shot_id or outcome["entity"] is None):
+        tree = outcome["shot_tree"] = ShotTree.load(session, project)
+        shot = tree.find_shot(shot_id) if shot_id else None
+        if shot is not None:
+            outcome.update(entity=shot, breadcrumb=tree.breadcrumb(shot), manual=True, error=None)
+
+    if outcome["entity"] is None:
+        return outcome
+
+    if task_type_id:
+        result = resolve_task_by_type_id(
+            session, project, outcome["entity"], outcome["breadcrumb"],
+            outcome["context"], task_type_id,
+        )
+        if result is not None:
+            outcome.update(result=result, manual=True)
+            return outcome
+
+    try:
+        outcome["result"] = resolve_task(
+            session, project, outcome["entity"], outcome["breadcrumb"],
+            outcome["task_type_name"], outcome["context"],
+        )
+    except TaskTypeMismatch:
+        outcome["error"] = (
+            " / ".join(outcome["breadcrumb"])
+            + f" — folder task type '{outcome['task_type_name']}' has no matching task in Kitsu"
+        )
+    return outcome
 
 
 class _AsyncWorker(QObject):
@@ -97,9 +169,14 @@ class KitsuPanel(QWidget):
         self.task_breadcrumb = None  # resolved entity names, top-down (see task_detection.detect_task)
         self.task_context = None  # "asset" or "shot"
         self._previous_task_id_for_detection = None  # self.task's id as of the last Detect Task click, before re-detection
-        self._pending_override_entity = None  # entity awaiting a manual task-type pick
-        self._pending_override_breadcrumb = None
-        self._pending_override_context = None
+        # What the task picker (Change Task) applies to: the asset/shot found
+        # by detection or picked by hand, its names, and "asset"/"shot".
+        self._picker_entity = None
+        self._picker_breadcrumb = None
+        self._picker_context = None
+        self._folder_task_type_name = None  # task-type folder name, for resolving a hand-picked shot
+        self._shot_tree = None  # task_detection.ShotTree for the picker, loaded lazily
+        self._shot_tree_project_id = None
         self._scene_path_for_override = None
         self._attachment_cache = {}  # attachment id -> local file path
         self._preview_cache = {}  # preview (revision) id -> local file path
@@ -389,17 +466,9 @@ class KitsuPanel(QWidget):
         self.task_label.setWordWrap(True)
         layout.addWidget(self.task_label)
 
-        self.task_type_override_label = QLabel("")
-        self.task_type_override_label.setWordWrap(True)
-        self.task_type_override_label.setVisible(False)
-        layout.addWidget(self.task_type_override_label)
-
-        self.task_type_override_combo = QComboBox()
-        self.task_type_override_combo.setVisible(False)
-        self.task_type_override_combo.currentIndexChanged.connect(
-            self._on_task_type_override_changed
-        )
-        layout.addWidget(self.task_type_override_combo)
+        self.task_picker = self._build_task_picker()
+        self.task_picker.setVisible(False)
+        layout.addWidget(self.task_picker)
 
         self.task_status_label = QLabel("")
         self.task_status_label.setVisible(False)
@@ -418,10 +487,56 @@ class KitsuPanel(QWidget):
         self.time_entry_group.setVisible(False)
         layout.addWidget(self.time_entry_group)
 
+        task_buttons_row = QHBoxLayout()
         self.refresh_button = QPushButton("Detect Task")
         self.refresh_button.setToolTip("Detect task from current scene")
         self.refresh_button.clicked.connect(self._on_refresh_task_clicked)
-        layout.addWidget(self.refresh_button)
+        task_buttons_row.addWidget(self.refresh_button)
+
+        self.change_task_button = QPushButton("Change Task...")
+        self.change_task_button.setToolTip(
+            "Pick the shot and/or task type by hand. The choice is remembered "
+            "for this script and wins over folder detection until reset."
+        )
+        self.change_task_button.clicked.connect(self._on_change_task_clicked)
+        task_buttons_row.addWidget(self.change_task_button)
+        layout.addLayout(task_buttons_row)
+        return group
+
+    def _build_task_picker(self):
+        """Episode -> Sequence -> Shot -> Task Type dropdowns, shown when
+        detection can't resolve the task or via Change Task. The shot rows
+        only appear for shot-context scripts, the episode row only for
+        projects that have episodes."""
+        group = QWidget()
+        layout = QFormLayout(group)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self.task_picker_hint_label = QLabel("")
+        self.task_picker_hint_label.setWordWrap(True)
+        layout.addRow(self.task_picker_hint_label)
+
+        def add_row(text, handler):
+            label = QLabel(text)
+            combo = QComboBox()
+            combo.currentIndexChanged.connect(handler)
+            layout.addRow(label, combo)
+            return label, combo
+
+        self.episode_label, self.episode_combo = add_row("Episode", self._on_episode_changed)
+        self.sequence_label, self.sequence_combo = add_row("Sequence", self._on_sequence_changed)
+        self.shot_label, self.shot_combo = add_row("Shot", self._on_shot_changed)
+        self.task_type_label, self.task_type_combo = add_row(
+            "Task Type", self._on_task_type_changed
+        )
+
+        self.reset_overrides_button = QPushButton("Reset to Folder Detection")
+        self.reset_overrides_button.setToolTip(
+            "Forget the shot/task type picked by hand for this script and "
+            "detect it from its folders again"
+        )
+        self.reset_overrides_button.clicked.connect(self._on_reset_overrides_clicked)
+        layout.addRow(self.reset_overrides_button)
         return group
 
     # Minutes, so the slider's actual step size can be a whole number —
@@ -610,12 +725,13 @@ class KitsuPanel(QWidget):
         self.comment_edit.setPlaceholderText("Comment")
         layout.addWidget(self.comment_edit)
 
-        layout.addWidget(self._section_label("Preview Image(s)"))
+        layout.addWidget(self._section_label("Preview Image(s) / Video"))
         self.variations_list = QListWidget()
         self.variations_list.setToolTip(
-            "Images to publish with this update, queued explicitly here — "
-            "nothing is captured automatically. The first image becomes "
-            "the main preview; any additional ones are added as "
+            "Images or videos to publish with this update, queued explicitly "
+            "here — nothing is captured automatically. The first item becomes "
+            "the main preview (a video, e.g. a farm-rendered MP4, is always "
+            "moved to the front); any additional ones are added as "
             "variations on the SAME revision (e.g. a different branch of "
             "the comp, or a pass on its own). If this list is empty, "
             "Publish just posts the "
@@ -637,8 +753,8 @@ class KitsuPanel(QWidget):
 
         self.add_variation_from_file_button = QPushButton("+ From File...")
         self.add_variation_from_file_button.setToolTip(
-            "Browse for an existing image on disk to queue as an image "
-            "to publish"
+            "Browse for an existing image or video (e.g. an MP4 rendered "
+            "on the farm) on disk to queue for publishing as a revision"
         )
         self.add_variation_from_file_button.clicked.connect(
             self._on_add_variation_from_file_clicked
@@ -920,51 +1036,66 @@ class KitsuPanel(QWidget):
         self._previous_task_id_for_detection = self.task.get("id") if self.task else None
         # Must resolve on the UI thread -- nuke_scene wraps `nuke` API
         # calls, which aren't safe to make from the background thread
-        # detect_task() below runs on (see _run_async).
+        # detection below runs on (see _run_async). Same for QSettings.
         scene_path = nuke_scene.scene_path()
         self._scene_path_for_override = scene_path
-        self._hide_task_type_override()
+        self._hide_task_picker()
+        remembered_shot_id = settings.load_shot_override(scene_path) if scene_path else None
+        remembered_task_type_id = (
+            settings.load_task_type_override(scene_path) if scene_path else None
+        )
 
         session = self.session
         project = self.project
 
         def work():
-            return detect_task(session, project, scene_path)
+            return _detect_with_overrides(
+                session, project, scene_path, remembered_shot_id, remembered_task_type_id
+            )
 
-        def on_done(result):
-            task, breadcrumb, context = result
-            self._apply_resolved_task(task, breadcrumb, context)
+        def on_done(outcome):
+            self._picker_entity = outcome["entity"]
+            self._picker_breadcrumb = outcome["breadcrumb"]
+            self._picker_context = outcome["context"]
+            self._folder_task_type_name = outcome["task_type_name"]
+            if outcome["shot_tree"] is not None:
+                self._store_shot_tree(outcome["shot_tree"])
+
+            if outcome["result"] is not None:
+                task, breadcrumb, context = outcome["result"]
+                self._apply_resolved_task(task, breadcrumb, context, manual=outcome["manual"])
+                return
+
+            self._clear_task(outcome["error"])
+            if outcome["entity"] is None:
+                hint = "Pick the shot this script belongs to:"
+            else:
+                hint = "Pick the task type:"
+            self._show_task_picker(hint)
 
         def on_error(exc):
-            # TaskTypeMismatch is a TaskDetectionError subclass -- checked
-            # first, same order as the try/except this replaced.
-            if isinstance(exc, TaskTypeMismatch):
-                self._handle_task_type_mismatch(exc, scene_path)
-                return
             if isinstance(exc, TaskDetectionError):
-                self.task = None
-                self.task_breadcrumb = None
-                self.task_context = None
-                self.task_label.setText(str(exc))
-                self.task_status_label.setVisible(False)
-                self.task_due_date_label.setVisible(False)
-                self.task_time_spent_label.setVisible(False)
-                self.time_entry_group.setVisible(False)
-                self._time_tracking_active = False
+                self._picker_entity = None
+                self._picker_breadcrumb = None
+                self._picker_context = None
+                self._clear_task(str(exc))
                 return
             self._set_status(f"Unexpected error detecting task: {exc}", is_error=True)
 
         self._run_async(work, on_done, on_error)
 
-    def _apply_resolved_task(self, task, breadcrumb, context):
+    def _apply_resolved_task(self, task, breadcrumb, context, manual=False):
         """Finish populating the task group for a resolved task, whether
-        it came straight out of detect_task or via the task-type override
-        picker below (a remembered choice, or one just made by hand)."""
-        self._hide_task_type_override()
+        it came straight out of folder detection or via the task picker
+        below (a remembered choice, or one just made by hand)."""
+        self._hide_task_picker()
         self.task = task
         self.task_breadcrumb = breadcrumb
         self.task_context = context
-        self.task_label.setText(" / ".join(breadcrumb))
+        label = " / ".join(breadcrumb)
+        if manual:
+            label += "  (set manually)"
+        self.task_label.setText(label)
 
         # Re-detecting the SAME task (e.g. just clicking "Detect Task"
         # again) shouldn't interrupt an already-running auto-tracker or
@@ -975,73 +1106,209 @@ class KitsuPanel(QWidget):
         self._update_task_details(task, restart_time_tracking=not same_task_as_before)
         self._load_comments()
 
-    def _hide_task_type_override(self):
-        self.task_type_override_label.setVisible(False)
-        self.task_type_override_combo.setVisible(False)
-        self.task_type_override_combo.blockSignals(True)
-        self.task_type_override_combo.clear()
-        self.task_type_override_combo.blockSignals(False)
-        self._pending_override_entity = None
-        self._pending_override_breadcrumb = None
-        self._pending_override_context = None
-
-    def _handle_task_type_mismatch(self, exc, scene_path):
-        remembered_id = settings.load_task_type_override(scene_path) if scene_path else None
-        if remembered_id:
-            task_type = next(
-                (
-                    t
-                    for t in self.session.all_task_types_for_project(self.project)
-                    if t.get("id") == remembered_id
-                ),
-                None,
-            )
-            if task_type:
-                task = self.session.get_task_by_entity(exc.entity, task_type)
-                if task:
-                    self._apply_resolved_task(
-                        task, exc.breadcrumb + [task_type.get("name", "?")], exc.context
-                    )
-                    return
-
+    def _clear_task(self, message):
         self.task = None
         self.task_breadcrumb = None
         self.task_context = None
+        self.task_label.setText(message or "No task detected")
         self.task_status_label.setVisible(False)
         self.task_due_date_label.setVisible(False)
         self.task_time_spent_label.setVisible(False)
         self.time_entry_group.setVisible(False)
         self._time_tracking_active = False
 
-        self._pending_override_entity = exc.entity
-        self._pending_override_breadcrumb = exc.breadcrumb
-        self._pending_override_context = exc.context
+    # ---- task picker (manual episode / sequence / shot / task type) ----
 
-        self.task_label.setText(
-            " / ".join(exc.breadcrumb) + " — task type not recognized"
-        )
-        self.task_type_override_label.setText(
-            f"Folder task type '{exc.task_type_name}' didn't match any task "
-            "type in this project — pick one:"
-        )
-        self.task_type_override_label.setVisible(True)
+    def _store_shot_tree(self, tree):
+        self._shot_tree = tree
+        self._shot_tree_project_id = self.project.get("id") if self.project else None
 
-        self.task_type_override_combo.blockSignals(True)
-        self.task_type_override_combo.addItem("Select task type…", None)
-        for task_type in self.session.all_task_types_for_project(self.project):
-            self.task_type_override_combo.addItem(
-                task_type.get("name", "?"), task_type
+    def _cached_shot_tree(self):
+        if self.project and self._shot_tree_project_id == self.project.get("id"):
+            return self._shot_tree
+        return None
+
+    def _on_change_task_clicked(self):
+        if self.task_picker.isVisible():
+            self._hide_task_picker()
+            return
+        if not (self.session and self.project):
+            QMessageBox.warning(self, "Kitsu", "Log in first.")
+            return
+        if self._picker_context is None:
+            QMessageBox.information(
+                self,
+                "Kitsu",
+                "Click Detect Task first. The task can only be changed by hand "
+                "for a script in a shot folder, or an asset that was found.",
             )
-        self.task_type_override_combo.setCurrentIndex(0)
-        self.task_type_override_combo.blockSignals(False)
-        self.task_type_override_combo.setVisible(True)
+            return
+        self._show_task_picker("Pick a different shot and/or task type:")
 
-    def _on_task_type_override_changed(self, _index):
-        task_type = self.task_type_override_combo.currentData()
-        if task_type is None or self._pending_override_entity is None:
+    def _show_task_picker(self, hint):
+        is_shot = self._picker_context == "shot"
+        tree = self._cached_shot_tree()
+        if is_shot and tree is None:
+            session = self.session
+            project = self.project
+            self.task_picker_hint_label.setText("Loading shots…")
+            self.task_picker.setVisible(True)
+
+            def on_done(loaded_tree):
+                self._store_shot_tree(loaded_tree)
+                self._show_task_picker(hint)
+
+            def on_error(exc):
+                self._set_status(f"Could not load the project's shots: {exc}", is_error=True)
+
+            self._run_async(lambda: ShotTree.load(session, project), on_done, on_error)
             return
 
-        task = self.session.get_task_by_entity(self._pending_override_entity, task_type)
+        self.task_picker_hint_label.setText(hint)
+        for widget in (self.sequence_label, self.sequence_combo, self.shot_label, self.shot_combo):
+            widget.setVisible(is_shot)
+        show_episodes = is_shot and tree.episodic
+        self.episode_label.setVisible(show_episodes)
+        self.episode_combo.setVisible(show_episodes)
+
+        if is_shot:
+            current_shot = self._picker_entity
+            episode, sequence = tree.parents(current_shot) if current_shot else (None, None)
+            self._fill_combo(self.episode_combo, "Select episode…", tree.episodes(), episode)
+            self._fill_combo(
+                self.sequence_combo,
+                "Select sequence…",
+                tree.sequences(episode.get("id")) if episode else (
+                    [] if tree.episodic else tree.sequences()
+                ),
+                sequence,
+            )
+            self._fill_combo(
+                self.shot_combo,
+                "Select shot…",
+                tree.shots(sequence.get("id")) if sequence else [],
+                current_shot,
+            )
+
+        current_task_type_id = self.task.get("task_type_id") if self.task else None
+        task_types = self.session.all_task_types_for_project(self.project) or []
+        current_task_type = next(
+            (t for t in task_types if t.get("id") == current_task_type_id), None
+        )
+        self._fill_combo(self.task_type_combo, "Select task type…", task_types, current_task_type)
+        self.task_type_combo.setEnabled(self._picker_entity is not None)
+
+        scene_path = self._scene_path_for_override
+        has_overrides = bool(
+            scene_path
+            and (
+                settings.load_shot_override(scene_path)
+                or settings.load_task_type_override(scene_path)
+            )
+        )
+        self.reset_overrides_button.setVisible(has_overrides)
+        self.task_picker.setVisible(True)
+
+    def _hide_task_picker(self):
+        self.task_picker.setVisible(False)
+
+    @staticmethod
+    def _fill_combo(combo, placeholder, items, selected=None):
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem(placeholder, None)
+        for item in items:
+            combo.addItem(item.get("name", "?"), item)
+            if selected is not None and item.get("id") == selected.get("id"):
+                combo.setCurrentIndex(combo.count() - 1)
+        combo.blockSignals(False)
+
+    def _on_episode_changed(self, _index):
+        tree = self._cached_shot_tree()
+        episode = self.episode_combo.currentData()
+        if tree is None:
+            return
+        self._fill_combo(
+            self.sequence_combo,
+            "Select sequence…",
+            tree.sequences(episode.get("id")) if episode else [],
+        )
+        self._fill_combo(self.shot_combo, "Select shot…", [])
+
+    def _on_sequence_changed(self, _index):
+        tree = self._cached_shot_tree()
+        sequence = self.sequence_combo.currentData()
+        if tree is None:
+            return
+        self._fill_combo(
+            self.shot_combo,
+            "Select shot…",
+            tree.shots(sequence.get("id")) if sequence else [],
+        )
+
+    def _on_shot_changed(self, _index):
+        tree = self._cached_shot_tree()
+        shot = self.shot_combo.currentData()
+        if shot is None or tree is None or not (self.session and self.project):
+            return
+
+        breadcrumb = tree.breadcrumb(shot)
+        self._picker_entity = shot
+        self._picker_breadcrumb = breadcrumb
+        self._picker_context = "shot"
+        self.task_type_combo.setEnabled(True)
+
+        scene_path = self._scene_path_for_override
+        if scene_path:
+            settings.save_shot_override(scene_path, shot.get("id"))
+        self.reset_overrides_button.setVisible(bool(scene_path))
+
+        # Task type for the new shot: the one picked in the combo, else
+        # the remembered pick, else the folder name.
+        picked_task_type = self.task_type_combo.currentData()
+        task_type_id = picked_task_type.get("id") if picked_task_type else None
+        if task_type_id is None and scene_path:
+            task_type_id = settings.load_task_type_override(scene_path)
+        session = self.session
+        project = self.project
+        folder_task_type_name = self._folder_task_type_name
+
+        def work():
+            if task_type_id:
+                result = resolve_task_by_type_id(
+                    session, project, shot, breadcrumb, "shot", task_type_id
+                )
+                if result is not None:
+                    return result
+            try:
+                return resolve_task(
+                    session, project, shot, breadcrumb, folder_task_type_name, "shot"
+                )
+            except TaskTypeMismatch:
+                return None
+
+        def on_done(result):
+            if result is None:
+                self._clear_task(
+                    " / ".join(breadcrumb) + " — no matching task, pick the task type:"
+                )
+                self.task_picker_hint_label.setText("Pick the task type:")
+                return
+            self._previous_task_id_for_detection = self.task.get("id") if self.task else None
+            task, task_breadcrumb, context = result
+            self._apply_resolved_task(task, task_breadcrumb, context, manual=True)
+
+        def on_error(exc):
+            self._set_status(f"Unexpected error resolving shot task: {exc}", is_error=True)
+
+        self._run_async(work, on_done, on_error)
+
+    def _on_task_type_changed(self, _index):
+        task_type = self.task_type_combo.currentData()
+        if task_type is None or self._picker_entity is None:
+            return
+
+        task = self.session.get_task_by_entity(self._picker_entity, task_type)
         if task is None:
             QMessageBox.warning(
                 self,
@@ -1055,11 +1322,19 @@ class KitsuPanel(QWidget):
         if scene_path:
             settings.save_task_type_override(scene_path, task_type.get("id"))
 
+        self._previous_task_id_for_detection = self.task.get("id") if self.task else None
         self._apply_resolved_task(
             task,
-            self._pending_override_breadcrumb + [task_type.get("name", "?")],
-            self._pending_override_context,
+            self._picker_breadcrumb + [task_type.get("name", "?")],
+            self._picker_context,
+            manual=True,
         )
+
+    def _on_reset_overrides_clicked(self):
+        scene_path = self._scene_path_for_override
+        if scene_path:
+            settings.clear_overrides(scene_path)
+        self._on_refresh_task_clicked()
 
     def _update_task_details(self, task, restart_time_tracking=True):
         status_name = self._resolve_task_status_name(task)
@@ -1707,7 +1982,12 @@ class KitsuPanel(QWidget):
 
     # ---- publish preview images (queued explicitly; first = main, rest = variations) ----
 
-    _VARIATION_IMAGE_FILTER = "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff)"
+    _VARIATION_IMAGE_FILTER = (
+        "Images and videos (*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.mp4 *.mov);;"
+        "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff);;"
+        "Videos (*.mp4 *.mov)"
+    )
+    _PUBLISH_VIDEO_EXTENSIONS = (".mp4", ".mov")
 
     def _refresh_variations_list(self):
         self.variations_list.clear()
@@ -1740,11 +2020,17 @@ class KitsuPanel(QWidget):
 
     def _on_add_variation_from_file_clicked(self):
         file_path, _filter = QFileDialog.getOpenFileName(
-            self, "Add Preview Image", "", self._VARIATION_IMAGE_FILTER
+            self, "Add Preview Image or Video", "", self._VARIATION_IMAGE_FILTER
         )
         if not file_path:
             return
-        self._pending_variations.append(file_path)
+        if file_path.lower().endswith(self._PUBLISH_VIDEO_EXTENSIONS):
+            # A video (typically the farm-rendered MP4) is the deliverable,
+            # so it becomes the main preview of the new revision rather
+            # than a variation hanging off a viewer snapshot.
+            self._pending_variations.insert(0, file_path)
+        else:
+            self._pending_variations.append(file_path)
         self._refresh_variations_list()
 
     def _on_remove_variation_clicked(self):

@@ -239,10 +239,19 @@ freezes Nuke's UI; every request also has a 10-second timeout.
    It decides whether shots sit **under episodes** from the *project
    itself* — only a Kitsu `tvshow` production has episodes.
 
-   If the task-type folder name doesn't match any task type in the
-   project, the panel offers a **task-type picker** instead of just
-   failing; the choice is remembered for that exact file path, so the
-   next Detect Task on the same script resolves silently.
+   If the folders don't resolve, the panel shows a **task picker** instead
+   of just failing. This covers a shot whose folders don't map to Kitsu,
+   for example a TV-show project with no episode folder on disk. It also
+   covers a task-type folder that matches no task in Kitsu. The picker has
+   cascading **Episode → Sequence → Shot** dropdowns (the episode row only
+   appears for projects with episodes) and a **Task Type** dropdown.
+   **Change Task...** opens the same picker at any time, so you can switch
+   to a different shot or task type by hand.
+
+   Manual picks are remembered for that exact file path. They take
+   precedence over folder detection on later Detect Task clicks, and the
+   breadcrumb is marked "(set manually)". **Reset to Folder Detection** in
+   the picker forgets them.
 
    The detected breadcrumb is shown in the Task section along with the
    task's current **Status**, **Due Date** ("Not set" if Kitsu has none),
@@ -322,7 +331,9 @@ doesn't define one.
    **Nothing is captured automatically.** Queue images explicitly with
    **+ From Viewer** (renders what the Viewer is showing at the current
    frame) or **+ From File...** (browse for an existing image, e.g. a
-   frame from a render), listed above the Publish button, with **Remove
+   frame from a render, or an **MP4/MOV video**, e.g. one rendered on the
+   farm; a video is always moved to the front, so it becomes the main
+   preview of the new revision), listed above the Publish button, with **Remove
    Selected** to drop one. The first image becomes the revision's main
    preview; the rest are uploaded as additional preview files on the
    **same revision/comment** (Kitsu's own multi-preview-per-revision
